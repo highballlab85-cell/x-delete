@@ -1,14 +1,9 @@
 import 'dotenv/config';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { createInterface } from 'node:readline/promises';
-import { stdin as input, stdout as output } from 'node:process';
-import { join, resolve } from 'node:path';
-import { chromium, type BrowserContext, type ElementHandle, type Page } from 'playwright';
+import { join } from 'node:path';
 import { logger } from './logger.js';
-import { randomWait, sleep } from './utils.js';
-import { SEL, selectorList } from './selectors.js';
-import { autoScrollAndCollect } from './scroll.js';
-import { deleteOriginal, undoRepost } from './x-actions.js';
+import { XApiClient, type TimelinePage, type TimelineTweet, XApiError } from './x-api.js';
+import { UsageLimitError, UsageTracker } from './usage-tracker.js';
 
 interface CliOptions {
   mode: 'dry' | 'auto';
@@ -18,6 +13,12 @@ interface CliOptions {
 
 interface CheckpointData {
   processed: string[];
+  nextToken?: string | null;
+}
+
+interface CheckpointState {
+  processed: Set<string>;
+  nextToken: string | null;
 }
 
 interface RunStats {
@@ -26,7 +27,7 @@ interface RunStats {
   unreposted: number;
   skipped: number;
   errors: number;
-  retries: number;
+  timelinePages: number;
 }
 
 const CHECKPOINT_PATH = join(process.cwd(), 'state', 'checkpoint.json');
@@ -36,18 +37,18 @@ function parseArgs(argv: string[]): CliOptions {
 
   for (const arg of argv) {
     if (arg.startsWith('--mode=')) {
-      const mode = arg.split('=')[1];
-      if (mode === 'dry' || mode === 'auto') {
-        options.mode = mode;
+      const value = arg.split('=')[1];
+      if (value === 'dry' || value === 'auto') {
+        options.mode = value;
       } else {
-        throw new Error(`--mode は dry か auto を指定してください: ${mode}`);
+        throw new Error(`--mode には dry もしくは auto を指定してください: ${value}`);
       }
     } else if (arg.startsWith('--max=')) {
-      const value = Number.parseInt(arg.split('=')[1], 10);
-      if (Number.isNaN(value) || value <= 0) {
+      const raw = Number.parseInt(arg.split('=')[1] ?? '', 10);
+      if (Number.isNaN(raw) || raw <= 0) {
         throw new Error('--max には 1 以上の整数を指定してください');
       }
-      options.max = value;
+      options.max = raw;
     } else if (arg === '--resume') {
       options.resume = true;
     }
@@ -56,178 +57,64 @@ function parseArgs(argv: string[]): CliOptions {
   return options;
 }
 
-function ensureDir(path: string) {
-  if (!existsSync(path)) {
-    mkdirSync(path, { recursive: true });
+function ensureStateDir() {
+  const stateDir = join(process.cwd(), 'state');
+  if (!existsSync(stateDir)) {
+    mkdirSync(stateDir, { recursive: true });
   }
 }
 
-function loadCheckpoint(resume: boolean): Set<string> {
+function loadCheckpoint(resume: boolean): CheckpointState {
   if (!resume || !existsSync(CHECKPOINT_PATH)) {
-    return new Set();
+    return { processed: new Set(), nextToken: null };
   }
 
   try {
-    const data = JSON.parse(readFileSync(CHECKPOINT_PATH, 'utf-8')) as CheckpointData;
-    return new Set(data.processed ?? []);
+    const raw = readFileSync(CHECKPOINT_PATH, 'utf-8');
+    const data = JSON.parse(raw) as CheckpointData;
+    return {
+      processed: new Set(data.processed ?? []),
+      nextToken: data.nextToken ?? null
+    };
   } catch (error) {
-    logger.warn({ error }, 'チェックポイントの読み込みに失敗しました。新規に作成します');
-    return new Set();
+    logger.warn({ error }, 'チェックポイントの読み込みに失敗したため新規ファイルを使用します');
+    return { processed: new Set(), nextToken: null };
   }
 }
 
-function saveCheckpoint(processed: Set<string>) {
-  const payload: CheckpointData = { processed: Array.from(processed) };
-  ensureDir(join(process.cwd(), 'state'));
+function saveCheckpoint(processed: Set<string>, nextToken: string | null) {
+  ensureStateDir();
+  const payload: CheckpointData = {
+    processed: Array.from(processed),
+    nextToken: nextToken ?? null
+  };
   writeFileSync(CHECKPOINT_PATH, JSON.stringify(payload, null, 2));
 }
 
-async function promptEnter(message: string) {
-  const rl = createInterface({ input, output });
-  await rl.question(`${message} Enter を押すと続行します。`);
-  rl.close();
+function parseLimit(envKey: string): number | undefined {
+  const raw = process.env[envKey];
+  if (raw === undefined || raw.trim() === '') {
+    return undefined;
+  }
+  const parsed = Number.parseInt(raw, 10);
+  if (Number.isNaN(parsed) || parsed < 0) {
+    throw new Error(`${envKey} には 0 以上の整数を指定してください`);
+  }
+  return parsed;
 }
 
-/**
- * プロフィールリンクが確認できるまでログイン状態を整える。
- */
-async function ensureLogin(page: Page) {
-  const selectors = selectorList(SEL.PROFILE_LINK);
-
-  for (const selector of selectors) {
-    try {
-      await page.waitForSelector(selector, { timeout: 5000 });
-      return;
-    } catch (error) {
-      logger.debug({ selector, error }, 'プロフィールリンク待機失敗');
+function retweetTargetId(tweet: TimelineTweet): string | null {
+  for (const ref of tweet.referenced_tweets ?? []) {
+    if (ref.type === 'retweeted') {
+      return ref.id;
     }
   }
-
-  logger.info('ログインが必要です。ブラウザでログインしてください');
-  await page.goto('https://x.com/login', { waitUntil: 'domcontentloaded' });
-  await promptEnter('X にログインし、2FA や CAPTCHA を完了してください。準備ができたら');
-
-  for (const selector of selectors) {
-    await page.waitForSelector(selector, { timeout: 0 });
-  }
+  return null;
 }
 
-/**
- * 左ナビのプロフィールリンクをクリックして本人プロフィールへ遷移する。
- */
-async function navigateToProfile(page: Page) {
-  for (const selector of selectorList(SEL.PROFILE_LINK)) {
-    const link = await page.$(selector);
-    if (link) {
-      await link.click();
-      await page.waitForLoadState('domcontentloaded');
-      return;
-    }
-  }
-  throw new Error('プロフィールリンクにアクセスできません');
-}
-
-/**
- * 投稿カードから status ID を抽出する。
- * 戻り値が null の場合は後続処理でスキップする。
- */
-async function extractStatusId(card: ElementHandle<HTMLElement>): Promise<string | null> {
-  try {
-    const result = await card.evaluate((node) => {
-      const anchor = node.querySelector<HTMLAnchorElement>('a[href*="/status/"]');
-      const href = anchor?.getAttribute('href') ?? anchor?.href ?? '';
-      const match = href.match(/status\/(\d+)/);
-      if (match) {
-        return match[1];
-      }
-      return href || null;
-    });
-    return result;
-  } catch (error) {
-    logger.warn({ error }, 'status ID の取得に失敗しました');
-    return null;
-  }
-}
-
-async function hasUndoButton(card: ElementHandle<HTMLElement>): Promise<boolean> {
-  for (const selector of selectorList(SEL.UNRETWEET)) {
-    const handle = await card.$(selector);
-    if (handle) {
-      await handle.dispose();
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * 1 カード分の削除とリポスト取り消しのフローを実行する。
- * 結果に応じて統計とチェックポイントを更新する。
- */
-async function processCard(
-  card: ElementHandle<HTMLElement>,
-  page: Page,
-  options: CliOptions,
-  processedSet: Set<string>,
-  stats: RunStats
-) {
-  const statusId = await extractStatusId(card);
-  if (!statusId) {
-    logger.warn('ステータス ID を特定できなかったためスキップします');
-    stats.skipped += 1;
-    stats.processed += 1;
-    return;
-  }
-
-  if (processedSet.has(statusId)) {
-    logger.debug({ statusId }, 'チェックポイント済みのためスキップ');
-    stats.skipped += 1;
-    stats.processed += 1;
-    return;
-  }
-
-  const isRepost = await hasUndoButton(card);
-
-  if (options.mode === 'dry') {
-    logger.info({ statusId, type: isRepost ? 'リポスト取消対象' : '削除対象' }, 'Dry-run: 対象を検出');
-    stats.processed += 1;
-    if (isRepost) {
-      stats.unreposted += 1;
-    } else {
-      stats.deleted += 1;
-    }
-    return;
-  }
-
-  let outcome: 'deleted' | 'skipped' | 'error' | 'unreposted';
-  if (isRepost) {
-    outcome = await undoRepost(card, page);
-  } else {
-    const result = await deleteOriginal(card, page);
-    outcome = result;
-  }
-
-  stats.processed += 1;
-
-  if (outcome === 'deleted') {
-    stats.deleted += 1;
-    processedSet.add(statusId);
-    saveCheckpoint(processedSet);
-    logger.info({ statusId }, '投稿を削除しました');
-  } else if (outcome === 'unreposted') {
-    stats.unreposted += 1;
-    processedSet.add(statusId);
-    saveCheckpoint(processedSet);
-    logger.info({ statusId }, 'リポストを取り消しました');
-  } else if (outcome === 'skipped') {
-    stats.skipped += 1;
-    processedSet.add(statusId);
-    saveCheckpoint(processedSet);
-    logger.info({ statusId }, '対象をスキップしました');
-  } else {
-    stats.errors += 1;
-    logger.error({ statusId }, '処理に失敗しました。後で再試行してください');
-  }
+async function resolveUserId(client: XApiClient): Promise<string> {
+  const { data } = await client.getOwnUser();
+  return data.id;
 }
 
 async function run() {
@@ -238,85 +125,227 @@ async function run() {
     unreposted: 0,
     skipped: 0,
     errors: 0,
-    retries: 0
+    timelinePages: 0
   };
+
+  const token = process.env.X_API_BEARER_TOKEN;
+  if (!token) {
+    throw new Error('X_API_BEARER_TOKEN を .env に設定してください');
+  }
+
+  const dailyLimit = parseLimit('X_API_DAILY_LIMIT');
+  const monthlyLimit = parseLimit('X_API_MONTHLY_LIMIT');
+  const usageTracker = new UsageTracker({ dailyLimit, monthlyLimit });
+
+  const client = new XApiClient(
+    { token, baseUrl: process.env.X_API_BASE_URL },
+    usageTracker
+  );
+
+  const checkpoint = loadCheckpoint(options.resume);
+  const processedSet = checkpoint.processed;
+  let paginationToken: string | undefined = options.resume ? checkpoint.nextToken ?? undefined : undefined;
+
+  let userId = process.env.X_USER_ID;
+  if (!userId) {
+    logger.info('X_USER_ID が未設定のため API から本人のユーザー ID を取得します');
+    try {
+      userId = await resolveUserId(client);
+    } catch (error) {
+      if (error instanceof UsageLimitError) {
+        logger.error('ユーザー ID 取得前に API 使用上限に達しました');
+        return;
+      }
+      if (error instanceof XApiError) {
+        logger.error({ status: error.status, payload: error.payload }, 'ユーザー ID 取得に失敗しました');
+        throw error;
+      }
+      throw error;
+    }
+  }
+
+  if (!userId) {
+    throw new Error('対象ユーザー ID を決定できませんでした');
+  }
+
+  logger.info(
+    {
+      mode: options.mode,
+      max: options.max,
+      resume: options.resume,
+      userId,
+      dailyRemaining: usageTracker.remainingDaily(),
+      monthlyRemaining: usageTracker.remainingMonthly()
+    },
+    'X API ベースの削除処理を開始します'
+  );
+
   const start = Date.now();
+  const shouldPersist = options.mode === 'auto';
+  let limitReached = false;
 
-  const envProfileDir = process.env.PLAYWRIGHT_USER_DATA_DIR;
-  const profileDir = envProfileDir ? resolve(envProfileDir) : resolve(process.cwd(), '.pw-user');
-  ensureDir(profileDir);
+  outer: while (true) {
+    if (options.max && stats.processed >= options.max) {
+      logger.info('指定された最大処理件数に達したため終了します');
+      break;
+    }
 
-  logger.info({ mode: options.mode, max: options.max, resume: options.resume }, 'x-post-wiper を開始します');
-  logger.info({ profileDir }, 'Playwright プロファイルディレクトリを使用します');
-
-  const processedSet = loadCheckpoint(options.resume);
-
-  let context: BrowserContext | null = null;
-
-  try {
-    context = await chromium.launchPersistentContext(profileDir, {
-      headless: false,
-      slowMo: 80,
-      viewport: { width: 1280, height: 900 }
-    });
-
-    let page = context.pages()[0] ?? (await context.newPage());
-    await page.goto('https://x.com/home', { waitUntil: 'domcontentloaded' });
-    await ensureLogin(page);
-    await navigateToProfile(page);
-
-    let emptyRounds = 0;
-    const emptyLimit = 4;
-
-    outer: while (true) {
-      if (options.max && stats.processed >= options.max) {
-        logger.info('指定件数に到達したため終了します');
+    const pageTokenUsed = paginationToken ?? null;
+    let timeline: TimelinePage;
+    try {
+      timeline = await client.fetchTimeline(userId, paginationToken);
+      stats.timelinePages += 1;
+    } catch (error) {
+      if (error instanceof UsageLimitError) {
+        logger.warn(
+          {
+            remainingDaily: usageTracker.remainingDaily(),
+            remainingMonthly: usageTracker.remainingMonthly()
+          },
+          'API 使用量が上限に達したため終了します'
+        );
+        limitReached = true;
         break;
+      }
+      if (error instanceof XApiError) {
+        if (error.status === 429) {
+          logger.warn({ status: error.status }, 'レートリミット応答が返されたため終了します');
+          limitReached = true;
+          break;
+        }
+        logger.error({ status: error.status, payload: error.payload }, 'タイムライン取得に失敗しました');
+        throw error;
+      }
+      throw error;
+    }
+
+    if (timeline.tweets.length === 0) {
+      logger.info('タイムラインから取得できる投稿が残っていません');
+      if (shouldPersist) {
+        saveCheckpoint(processedSet, paginationToken ?? null);
+      }
+      break;
+    }
+
+    for (const tweet of timeline.tweets) {
+      if (options.max && stats.processed >= options.max) {
+        break outer;
+      }
+
+      const statusId = tweet.id;
+      if (processedSet.has(statusId)) {
+        stats.skipped += 1;
+        stats.processed += 1;
+        continue;
+      }
+
+      const targetTweetId = retweetTargetId(tweet);
+
+      if (options.mode === 'dry') {
+        stats.processed += 1;
+        if (targetTweetId) {
+          stats.unreposted += 1;
+          logger.info({ statusId, sourceTweetId: targetTweetId }, 'Dry-run: リポスト取消対象');
+        } else {
+          stats.deleted += 1;
+          logger.info({ statusId }, 'Dry-run: 削除対象');
+        }
+        continue;
       }
 
       try {
-        const cards = await autoScrollAndCollect(page);
-        if (!cards.length) {
-          emptyRounds += 1;
-          if (emptyRounds >= emptyLimit) {
-            logger.info('新規カードが見つからないため終了します');
-            break;
+        let success = false;
+        if (targetTweetId) {
+          success = await client.undoRetweet(userId, targetTweetId);
+          if (success) {
+            stats.unreposted += 1;
+            logger.info({ statusId, sourceTweetId: targetTweetId }, 'リポストを取り消しました');
+          } else {
+            stats.skipped += 1;
+            logger.warn({ statusId, sourceTweetId: targetTweetId }, 'リポスト取消 API から削除済みの応答を受け取りました');
           }
-          await sleep(randomWait(1000, 1800));
-          continue;
+        } else {
+          success = await client.deleteTweet(statusId);
+          if (success) {
+            stats.deleted += 1;
+            logger.info({ statusId }, '投稿を削除しました');
+          } else {
+            stats.skipped += 1;
+            logger.warn({ statusId }, '削除 API から削除済みの応答を受け取りました');
+          }
         }
 
-        emptyRounds = 0;
-        for (const card of cards) {
-          if (options.max && stats.processed >= options.max) {
-            break outer;
-          }
-          await processCard(card, page, options, processedSet, stats);
+        stats.processed += 1;
+        processedSet.add(statusId);
+        if (shouldPersist) {
+          saveCheckpoint(processedSet, pageTokenUsed);
         }
       } catch (error) {
-        stats.retries += 1;
-        logger.error({ error, retry: stats.retries }, 'カード処理中にエラーが発生しました。ページを再読み込みします');
-        if (stats.retries > 3) {
-          throw new Error('最大リトライ回数を超えました');
+        if (error instanceof UsageLimitError) {
+          logger.warn({ statusId }, 'API 使用上限に達したため処理を終了します');
+          limitReached = true;
+          break outer;
         }
-        await page.reload({ waitUntil: 'domcontentloaded' });
-        await promptEnter('2FA や CAPTCHA を解決してください。準備ができたら');
+
+        if (error instanceof XApiError) {
+          if (error.status === 404) {
+            logger.info({ statusId }, '既に削除済みのためスキップしました');
+            stats.skipped += 1;
+            stats.processed += 1;
+            processedSet.add(statusId);
+            if (shouldPersist) {
+              saveCheckpoint(processedSet, pageTokenUsed);
+            }
+            continue;
+          }
+
+          if (error.status === 429) {
+            logger.warn({ statusId }, 'レートリミット応答が返されたため終了します');
+            limitReached = true;
+            break outer;
+          }
+
+          logger.error({ statusId, status: error.status, payload: error.payload }, 'X API 呼び出しでエラーが発生しました');
+        } else {
+          logger.error({ statusId, error }, '想定外のエラーが発生しました');
+        }
+
+        stats.errors += 1;
+        stats.processed += 1;
       }
     }
-  } catch (error) {
-    logger.error({ error }, '致命的エラーで終了します');
-    process.exitCode = 1;
-  } finally {
-    if (context) {
-      await context.close();
+
+    if (limitReached) {
+      break;
+    }
+
+    if (!timeline.nextToken) {
+      if (shouldPersist) {
+        saveCheckpoint(processedSet, null);
+      }
+      logger.info('これ以上古い投稿が存在しないため終了します');
+      break;
+    }
+
+    paginationToken = timeline.nextToken;
+    if (shouldPersist) {
+      saveCheckpoint(processedSet, timeline.nextToken);
     }
   }
 
   const elapsed = Math.round((Date.now() - start) / 1000);
-  logger.info({ stats, elapsed }, '処理が完了しました');
+  logger.info(
+    {
+      stats,
+      elapsed,
+      usage: usageTracker.getSnapshot(),
+      limitReached
+    },
+    '処理が完了しました'
+  );
 }
 
 run().catch((error) => {
-  logger.error({ error }, '予期しないエラー');
+  logger.error({ error }, '予期しないエラーが発生しました');
   process.exitCode = 1;
 });
